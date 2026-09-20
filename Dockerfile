@@ -53,6 +53,36 @@ COPY --chown=appuser:appuser . .
 
 RUN chmod +x scripts/docker-entrypoint.sh
 
+# One directory has to be writable, and it is not the source tree.
+#
+# `collectstatic` writes to STATIC_ROOT, which is /app/staticfiles, and
+# .dockerignore keeps staticfiles/ out of the build context -- so the directory
+# does not exist in the image.
+#
+# /app itself was created by WORKDIR as root, and `COPY --chown` only sets the
+# ownership of the files it copies, not of the directory they land in. The
+# non-root user therefore cannot create anything inside /app, and the container
+# dies on every start with
+#
+#   PermissionError: [Errno 13] Permission denied: '/app/staticfiles'
+#
+# which `restart: unless-stopped` faithfully turns into a crash loop: the service
+# is up for two seconds, restarts, and is never reachable. Creating the single
+# directory the application needs to write, and handing over only that one,
+# keeps the rest of the tree read-only to the process.
+#
+# Collecting at build time instead would be the better answer if it were
+# possible: SECRET_KEY is required before settings will import, and injecting it
+# as a build argument would bake a secret into a layer.
+#
+# Anything else the process is asked to write needs the same treatment. There are
+# two such switches and neither is set here: PROMETHEUS_MULTIPROC_DIR (opt-in,
+# see the CMD below) and LOG_FILE, which only applies when LOG_TO_FILE is turned
+# on. Setting either one without creating its directory reproduces this exact
+# crash loop.
+RUN mkdir -p /app/staticfiles \
+    && chown appuser:appuser /app/staticfiles
+
 USER appuser
 
 EXPOSE 8000
