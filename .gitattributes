@@ -1,0 +1,41 @@
+# Line-ending policy.
+#
+# The problem this solves: Git on Windows converts LF to CRLF on checkout by
+# default. A shell script with CRLF endings fails on Linux with
+# `\r: not found`, and the error names a line that looks completely fine. The
+# container entrypoint is exactly such a script, so the container would refuse to
+# start on a machine that cloned the repository on Windows.
+#
+# The fix is to normalise to LF in the repository and force LF on checkout for
+# everything that a Unix tool will read.
+* text=auto eol=lf
+
+# Explicit, because these are the files where getting it wrong is not a cosmetic
+# issue: shell scripts, container definitions and CI configuration.
+#
+# Note: no trailing comments on these lines. `.gitattributes` does not support
+# them -- everything after the attribute list is parsed as more attribute names,
+# and git reports "`#` is not a valid attribute name" without saying which line
+# it meant.
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+Makefile    text eol=lf
+
+# PowerShell on Windows expects CRLF.
+*.ps1       text eol=crlf
+
+# Binary files must not be touched at all.
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.gif       binary
+*.ico       binary
+*.pdf       binary
+*.woff      binary
+*.woff2     binary
+
+# Keep generated lock files out of diffs -- they are machine-written and a merge
+# conflict in one is never resolved by hand.
+*.lock      -diff

@@ -1,24 +1,62 @@
 # Python
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
 
-# Django
-staticfiles/
-db.sqlite3
-
-# Envs/Secrets
-.env
-*.env
-app.log
-
-# Venvs
+# Virtual environments
 .venv/
 venv/
+env/
 ENV/
-.envrc
 
-# IDE
-.vscode/
+# Testing and linting caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Django
+*.log
+app.log
+app.log.*
+db.sqlite3
+db.sqlite3-journal
+staticfiles/
+media/
+
+# Environment and secrets
+#
+# `.env` is never committed. `.env.example` is the template and is the only
+# environment file in the repository -- it contains placeholders, never values.
+.env
+.env.*
+!.env.example
+
+# Monitoring runtime state
+#
+# The provisioning *config* is committed; the runtime data is not. Grafana's
+# SQLite database and Prometheus' TSDB are both regenerated on startup.
+monitoring/grafana/data/
+monitoring/prometheus/data/
+
+# Editors
 .idea/
+.vscode/
+*.swp
+*.swo
+
+# Operating systems
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Local scratch
+/tmp/
+scratch/

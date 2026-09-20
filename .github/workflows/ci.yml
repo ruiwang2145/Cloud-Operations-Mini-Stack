@@ -1,0 +1,218 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel a run that has been superseded by a newer push to the same branch.
+# Without this, three quick pushes leave three full builds queued and the
+# feedback on the latest one arrives last.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Not a secret. The settings module refuses to start without a signing key, and
+  # CI has no secret manager -- that refusal is the point, and it is why this has
+  # to be set explicitly rather than defaulted in code.
+  SECRET_KEY: ci-only-key-not-used-for-anything-real
+  # Keep the test log quiet and off disk.
+  LOG_TO_FILE: "False"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Static checks and the test suite.
+  #
+  # Ordered cheapest-first so a lint error does not wait for a three-minute test
+  # run to be reported.
+  # ---------------------------------------------------------------------------
+  checks:
+    name: lint and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Django system checks
+        run: python manage.py check
+
+      - name: Django deployment checklist (informational)
+        # Not blocking on purpose: the checklist is a list of things to consider,
+        # not a list of things that are wrong. Running it here keeps the
+        # considerations visible without failing the build on a warning about a
+        # header that is terminated at the load balancer anyway.
+        continue-on-error: true
+        run: python manage.py check --deploy
+
+      - name: Test suite
+        run: python -m pytest -q
+
+      - name: Alert rules are in sync with the SLO definition
+        # The objective appears in the API report, the documentation and the alert
+        # rules. This is the step that stops the third one drifting.
+        run: python scripts/render_rules.py --check
+
+      - name: Migrations are complete
+        # A model change without a migration passes every test (Django builds the
+        # test database from the models) and fails on the first real deploy.
+        run: python manage.py makemigrations --check --dry-run
+
+      - name: No missing migrations for the ops app either
+        run: python manage.py makemigrations ops --check --dry-run
+
+  # ---------------------------------------------------------------------------
+  # The container image builds.
+  #
+  # Separate from the tests because it is slower and because a build failure is a
+  # different class of problem from a test failure -- knowing which one broke
+  # should not require reading the log.
+  # ---------------------------------------------------------------------------
+  docker-build:
+    name: container image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: cloud-ops-mini-stack:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Image starts and answers a liveness probe
+        # The image is not just built, it is run. A container that builds and
+        # cannot start is a build that passes and a deploy that fails.
+        run: |
+          docker run --rm -d --name cloudops-ci \
+            -e SECRET_KEY=ci-only-key-not-used-for-anything-real \
+            -e DEBUG=False \
+            -e ALLOWED_HOSTS=localhost,127.0.0.1 \
+            -e DATABASE_URL=sqlite:////tmp/ci.sqlite3 \
+            -e LOG_TO_FILE=False \
+            -e RUN_COLLECTSTATIC=True \
+            -p 8000:8000 \
+            cloud-ops-mini-stack:ci
+
+          for attempt in $(seq 1 30); do
+            if curl -fsS http://localhost:8000/healthz/ > /dev/null 2>&1; then
+              echo "liveness answered after ${attempt} attempt(s)"
+              curl -fsS http://localhost:8000/readyz/ | head -20
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "the container never became healthy; logs follow" >&2
+          docker logs cloudops-ci >&2
+          exit 1
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f cloudops-ci || true
+
+  # ---------------------------------------------------------------------------
+  # The full stack comes up and passes the smoke test.
+  #
+  # This is the job that actually proves the project works: it exercises the
+  # compose file, the entrypoint, the migrations, the static files, the database
+  # wiring and every endpoint -- none of which the unit tests touch.
+  # ---------------------------------------------------------------------------
+  end-to-end:
+    name: docker compose stack + smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Start the stack
+        # `--wait` blocks until every service with a healthcheck reports healthy
+        # and every other service is running, which removes the need for a sleep
+        # loop that is either too short (flaky) or too long (slow).
+        run: docker compose up -d --build --wait --wait-timeout 300
+
+      - name: Show what came up
+        if: always()
+        run: docker compose ps
+
+      - name: Seed some data
+        run: docker compose exec -T web python manage.py seed_tasks --count 25
+
+      - name: Smoke test
+        run: python scripts/smoke_test.py --base-url http://localhost:8000
+
+      - name: Incident drill
+        # Detection is part of the contract, so it is tested like any other
+        # behaviour rather than trusted.
+        run: python scripts/run_drill.py --drill unhandled-exception --base-url http://localhost:8000
+
+      - name: Cardinality drill
+        run: python scripts/run_drill.py --drill unknown-path-scan --base-url http://localhost:8000 --scan-requests 100
+
+      - name: Prometheus is scraping and the rules are loaded
+        run: |
+          set -euo pipefail
+          # Give Prometheus a couple of scrape intervals to see the target.
+          for attempt in $(seq 1 20); do
+            up=$(curl -fsS http://localhost:9090/api/v1/query \
+                  --data-urlencode 'query=up{job="cloud-ops-mini-stack"}' \
+                  | python -c 'import json,sys; r=json.load(sys.stdin)["data"]["result"]; print(r[0]["value"][1] if r else "0")')
+            [ "$up" = "1" ] && break
+            sleep 3
+          done
+          echo "target up = $up"
+          [ "$up" = "1" ] || { echo "Prometheus is not scraping the application" >&2; exit 1; }
+
+          rules=$(curl -fsS http://localhost:9090/api/v1/rules \
+                  | python -c 'import json,sys; print(sum(len(g["rules"]) for g in json.load(sys.stdin)["data"]["groups"]))')
+          echo "alert rules loaded = $rules"
+          [ "$rules" -ge 9 ] || { echo "expected at least 9 alert rules, got $rules" >&2; exit 1; }
+
+      - name: Grafana has the provisioned dashboards
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 20); do
+            dashboards=$(curl -fsS -u admin:admin http://localhost:3000/api/search?type=dash-db 2>/dev/null || echo '[]')
+            count=$(echo "$dashboards" | python -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)
+            [ "$count" -ge 2 ] && break
+            sleep 3
+          done
+          echo "dashboards = $count"
+          [ "$count" -ge 2 ] || { echo "Grafana did not provision the dashboards" >&2; exit 1; }
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

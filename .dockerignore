@@ -1,0 +1,57 @@
+# Build context exclusions.
+#
+# Smaller context = faster builds, but the reason this file matters is different:
+# anything not excluded here is baked into an image layer. `.env` contains real
+# credentials and `.git` contains the entire project history, including any
+# secret that was ever committed and later removed.
+
+# --- Secrets and local configuration ---------------------------------------
+.env
+.env.*
+!.env.example
+
+# --- Version control --------------------------------------------------------
+.git
+.gitignore
+.gitattributes
+
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Runtime artefacts ------------------------------------------------------
+*.log
+app.log
+db.sqlite3
+staticfiles/
+media/
+
+# --- Monitoring runtime state ----------------------------------------------
+monitoring/grafana/data/
+monitoring/prometheus/data/
+
+# --- Editor and OS ----------------------------------------------------------
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# --- Documentation ----------------------------------------------------------
+# Screenshots and diagrams are served from GitHub; they do not need to be in the
+# image, and a few megabytes of PNG in every layer adds up.
+docs/**/*.png
+docs/**/*.jpg
+
+# --- CI and local tooling ---------------------------------------------------
+.github/
+Makefile
+docker-compose.yml
+Dockerfile
+.dockerignore

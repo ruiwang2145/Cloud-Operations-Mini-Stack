@@ -1,37 +1,19 @@
-"""
-URL configuration for my_cloudapp project.
+"""Root URL configuration.
 
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/5.2/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
+Read this together with ``ops/urls.py`` and ``tasks/urls.py``.
+
+Ordering note: ``ops.urls`` is mounted at the empty prefix because it owns the
+operational endpoints that must live at the root (/healthz/, /readyz/, /metrics).
+Django keeps trying the remaining top-level patterns when a nested resolver
+raises ``Resolver404``, so a request for ``/api/tasks/`` falls through to the
+``api/`` include below instead of 404-ing. The order is deliberate, not
+accidental, and ``ops/tests/test_routing.py`` pins it down.
 """
 from django.contrib import admin
-from django.urls import path
-from django.http import JsonResponse
-
-
-def healthz(_):
-    return JsonResponse({"status": "ok"})
-
-def boom(_):
-    raise RuntimeError("test error")
-
-def trigger_error(request):
-    division_by_zero = 1 / 0
-
+from django.urls import include, path
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('healthz/', healthz),
-    path("boom/", boom),
-    path('sentry-debug/', trigger_error),
+    path("admin/", admin.site.urls),
+    path("", include("ops.urls")),
+    path("api/", include("tasks.urls")),
 ]

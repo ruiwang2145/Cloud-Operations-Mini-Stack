@@ -1,0 +1,202 @@
+# =============================================================================
+# GENERATED FILE -- DO NOT EDIT BY HAND
+#
+#   Regenerate with:  python scripts/render_rules.py
+#   Verify with:      python scripts/render_rules.py --check
+#
+# The objectives below are rendered from my_cloudapp/settings.py, so the alerts,
+# the /api/slo/ endpoint and docs/SLO.md cannot drift apart.
+#
+# There is no Alertmanager in this stack, so firing alerts are visible in the
+# Prometheus UI at /alerts. Routing them to a real destination
+# (Alertmanager -> PagerDuty/Slack) is a deployment concern and would live next
+# to this file. See docs/SLO.md.
+# =============================================================================
+
+groups:
+  - name: availability
+    interval: 30s
+    rules:
+      # ---------------------------------------------------------------------
+      # The service is not answering at all.
+      #
+      # `up` is produced by Prometheus itself, so this rule keeps working when
+      # the application is too broken to export metrics -- which is exactly the
+      # case it exists to catch.
+      # ---------------------------------------------------------------------
+      - alert: ServiceDown
+        expr: up{job="cloud-ops-mini-stack"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "cloud-ops-mini-stack is not being scraped"
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} for 2 minutes. Either the
+            process is gone or /metrics is not answering.
+          runbook: "docs/runbooks/service-down.md"
+
+      # ---------------------------------------------------------------------
+      # Fast burn: 14.4x the sustainable rate over 1h.
+      # At this rate about 2.0% of a 30-day budget is
+      # consumed per hour, so the budget does not survive the day.
+      # ---------------------------------------------------------------------
+      - alert: AvailabilityBudgetBurnFast
+        expr: |
+          sum(rate(app_http_requests_total{status_class="5xx",endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[1h]))
+            /
+            sum(rate(app_http_requests_total{endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[1h]))
+            / 0.005 > 14.4
+        for: 2m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "Availability error budget burning 14.4x too fast"
+          description: >-
+            Over the last 1h the 5xx ratio is {{ $value | humanize }}x the rate the
+            99.500% objective allows. Check
+            app_slo_error_budget_remaining_ratio for what is left.
+          runbook: "docs/runbooks/high-error-rate.md"
+
+      # ---------------------------------------------------------------------
+      # Slow burn: 6.0x over 6h. Real, survivable, and worth
+      # a human during working hours.
+      # ---------------------------------------------------------------------
+      - alert: AvailabilityBudgetBurnSlow
+        expr: |
+          sum(rate(app_http_requests_total{status_class="5xx",endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[6h]))
+            /
+            sum(rate(app_http_requests_total{endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[6h]))
+            / 0.005 > 6.0
+        for: 30m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "Availability error budget burning 6.0x too fast"
+          description: >-
+            Sustained over 6h. Not an outage yet, but at this rate the
+            99.500% objective is missed before the end of the window.
+          runbook: "docs/runbooks/high-error-rate.md"
+
+      # ---------------------------------------------------------------------
+      # Acute error rate, independent of the budget. A service can be inside its
+      # monthly budget and still be broken right now.
+      # ---------------------------------------------------------------------
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(app_http_requests_total{status_class="5xx",endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[5m]))
+            /
+            sum(rate(app_http_requests_total{endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[5m])) > 0.05
+        for: 5m
+        labels:
+          severity: critical
+          slo: availability
+        annotations:
+          summary: "More than 5% of requests are failing"
+          description: >-
+            The 5xx ratio over 5m is {{ $value | humanizePercentage }}.
+          runbook: "docs/runbooks/high-error-rate.md"
+
+      # ---------------------------------------------------------------------
+      # The error budget is gone. This is the point at which the agreed policy
+      # says feature work stops and reliability work starts.
+      # ---------------------------------------------------------------------
+      - alert: ErrorBudgetExhausted
+        expr: app_slo_error_budget_remaining_ratio <= 0
+        for: 10m
+        labels:
+          severity: warning
+          slo: availability
+        annotations:
+          summary: "Availability error budget exhausted"
+          description: >-
+            Measured availability over the evaluation window is below the
+            99.500% objective. See docs/SLO.md for the budget policy.
+          runbook: "docs/runbooks/high-error-rate.md"
+
+  - name: latency
+    interval: 30s
+    rules:
+      # ---------------------------------------------------------------------
+      # Latency objective: 99.0% of requests under 300 ms.
+      #
+      # Measured against the 300 ms histogram bucket, the smallest bucket
+      # that is not below the objective.
+      # ---------------------------------------------------------------------
+      - alert: LatencyObjectiveBreach
+        expr: |
+          sum(rate(app_http_request_duration_seconds_bucket{le="0.3",endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[10m]))
+          /
+          sum(rate(app_http_request_duration_seconds_count{endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[10m])) < 0.99
+        for: 10m
+        labels:
+          severity: warning
+          slo: latency
+        annotations:
+          summary: "Fewer than 99.0% of requests meet the 300 ms objective"
+          description: >-
+            Compliance over the last 10m is {{ $value | humanizePercentage }}. Check the
+            per-endpoint breakdown before assuming the database is at fault.
+          runbook: "docs/runbooks/high-latency.md"
+
+  - name: operations
+    interval: 30s
+    rules:
+      # ---------------------------------------------------------------------
+      # A readiness probe failed. The instance took itself out of the load
+      # balancer, so no user saw an error -- but a dependency is unhealthy and
+      # the next failure may not be absorbed.
+      # ---------------------------------------------------------------------
+      - alert: ReadinessCheckFailing
+        expr: increase(app_readiness_failures_total[5m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: operations
+        annotations:
+          summary: "Readiness probe failing for dependency {{ $labels.dependency }}"
+          description: >-
+            {{ $labels.dependency }} failed {{ $value | humanize }} readiness check(s) in the last
+            5 minutes.
+          runbook: "docs/runbooks/database-unreachable.md"
+
+      # ---------------------------------------------------------------------
+      # The SLO reporter could not reach Prometheus and fell back to the
+      # in-process registry. Monitoring has become partially blind: the report
+      # is still served, but over the lifetime of the process instead of the
+      # configured window.
+      # ---------------------------------------------------------------------
+      - alert: SloReporterDegraded
+        expr: increase(app_slo_evaluation_fallbacks_total[15m]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          slo: operations
+        annotations:
+          summary: "SLO reporter cannot query Prometheus"
+          description: >-
+            {{ $value | humanize }} evaluation(s) fell back to the local registry
+            ({{ $labels.reason }}). /api/slo/ is reporting process-lifetime numbers, not the
+            configured window.
+          runbook: "docs/runbooks/metrics-and-logs.md"
+
+      # ---------------------------------------------------------------------
+      # The service is reachable but nobody is using it. Usually a broken load
+      # balancer or a bad routing deploy rather than a quiet day.
+      # ---------------------------------------------------------------------
+      - alert: NoTraffic
+        expr: |
+          sum(rate(app_http_requests_total{endpoint!~"/healthz/|/metrics|/readyz/|/version/"}[15m])) == 0
+        for: 30m
+        labels:
+          severity: warning
+          slo: operations
+        annotations:
+          summary: "No application traffic for 30 minutes"
+          description: >-
+            Probe endpoints are excluded, so this is real user traffic that has
+            stopped -- not a monitoring artefact.
+          runbook: "docs/runbooks/service-down.md"

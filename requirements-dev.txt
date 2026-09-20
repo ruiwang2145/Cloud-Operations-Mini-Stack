@@ -1,0 +1,14 @@
+# Test and tooling dependencies. Kept out of the runtime image: pytest and its
+# plugins have no business in a container that serves traffic.
+-r requirements.txt
+
+pytest==9.1.1
+pytest-django==4.14.0
+
+# YAML parsing, used by scripts/render_rules.py to validate the alert rules it
+# generates and by the CI drift check.
+PyYAML==6.0.3
+
+# Linting. Configured in pyproject.toml with a deliberately small rule set --
+# see the comment there for why.
+ruff==0.16.8

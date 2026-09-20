@@ -1,0 +1,32 @@
+# Grafana dashboard provisioning.
+#
+# Every JSON file under /etc/grafana/dashboards is loaded on startup and kept in
+# sync: edit the file in the repository, restart Grafana, and the dashboard
+# changes. Dashboards edited in the UI are not written back to disk, which is the
+# point -- the repository is the source of truth and a dashboard that only exists
+# in one person's browser is not a monitoring asset.
+#
+# To develop a dashboard interactively: set `allowUiUpdates: true` (already on
+# here), iterate in the UI, then use "Export for sharing externally" or
+# "Save JSON to file" and commit the result.
+
+apiVersion: 1
+
+providers:
+  - name: cloud-ops-mini-stack
+    orgId: 1
+    folder: "Cloud Ops"
+    folderUid: cloud-ops
+    type: file
+    # False so a dashboard deleted from the repository is also removed from
+    # Grafana. With `disableDeletion: true` the old dashboard lingers forever and
+    # nobody can tell which of the two is current.
+    disableDeletion: false
+    # Re-read the directory periodically. Together with a bind mount this means a
+    # `docker compose restart grafana` is not needed after editing JSON.
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/dashboards
+      # Each file declares its own uid; the folder comes from `folder` above.
+      foldersFromFilesStructure: false

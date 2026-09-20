@@ -1,0 +1,64 @@
+# =============================================================================
+# Prometheus scrape and rule configuration.
+#
+# The alert rules are NOT in this file: they are generated from the SLO
+# definition by scripts/render_rules.py and loaded via `rule_files` below.
+# =============================================================================
+
+global:
+  # Matches SLO_CACHE_SECONDS in the application. There is no point scraping
+  # faster than the report refreshes, and no point caching longer than the scrape
+  # interval -- keeping the two equal means a dashboard and /api/slo/ never
+  # disagree by more than one cycle.
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+  # Attached to every series Prometheus sends onwards (to a remote write target
+  # or to an Alertmanager). Without it, the same metric name from two
+  # environments is indistinguishable once it leaves this server.
+  external_labels:
+    service: cloud-ops-mini-stack
+    environment: docker
+
+rule_files:
+  - /etc/prometheus/alert_rules.yml
+
+scrape_configs:
+  # ---------------------------------------------------------------------------
+  # The application.
+  # ---------------------------------------------------------------------------
+  - job_name: cloud-ops-mini-stack
+    # No trailing slash. django-prometheus registers the view at `metrics`, and
+    # Django's APPEND_SLASH does not strip slashes, so `/metrics/` returns 404 and
+    # the scrape fails silently with `up == 0` while looking perfectly correct in
+    # the config file.
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      # Inside docker compose, `web` is the service name.
+      - targets: ["web:8000"]
+        labels:
+          env: docker
+          tier: application
+
+      # Running the app outside a container (`manage.py runserver`)? Comment out
+      # the target above and use this one instead, then point PROMETHEUS_URL at
+      # this server so /api/slo/ can query the real history:
+      #
+      # - targets: ["host.docker.internal:8000"]
+      #   labels:
+      #     env: local
+      #     tier: application
+
+  # ---------------------------------------------------------------------------
+  # Prometheus itself.
+  #
+  # Worth scraping: scrape_duration_seconds tells you whether the target is slow
+  # to respond, which is often the first symptom of an overloaded service and is
+  # invisible from the application's own metrics.
+  # ---------------------------------------------------------------------------
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+        labels:
+          tier: monitoring

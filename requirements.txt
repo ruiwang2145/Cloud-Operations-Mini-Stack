@@ -1,0 +1,36 @@
+# Runtime dependencies for the Cloud Operations Mini Stack.
+#
+# Pinned exactly. An unpinned requirements file means the image that runs in
+# production is not the image that passed CI, and "it worked yesterday" becomes
+# an unfalsifiable claim. Bump deliberately, one package at a time, with the test
+# suite as the safety net.
+
+# --- Web framework ----------------------------------------------------------
+Django==5.2.17
+djangorestframework==3.18.1
+
+# --- WSGI server ------------------------------------------------------------
+# Used in the container and on PythonAnywhere; runserver is development only.
+gunicorn==26.2.0
+
+# --- Database driver --------------------------------------------------------
+# psycopg 3 (binary wheel: no compiler needed in the image). The `[binary]` extra
+# is spelled out here so a `pip install -r` gives the same result as the
+# bootstrap scripts.
+psycopg[binary]==3.3.6
+
+# --- Configuration ----------------------------------------------------------
+python-dotenv==1.2.3
+dj-database-url==3.1.2
+
+# --- Observability ----------------------------------------------------------
+# prometheus-client is a transitive dependency of django-prometheus, but it is
+# the library the application imports directly (ops/metrics.py), so it is pinned
+# here as a first-class dependency rather than relied on implicitly.
+prometheus-client==0.26.0
+django-prometheus==2.5.0
+sentry-sdk==2.69.2
+
+# --- Static files -----------------------------------------------------------
+# Production static file serving; not mounted in DEBUG (see settings.MIDDLEWARE).
+whitenoise==6.12.0

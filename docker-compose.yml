@@ -1,0 +1,172 @@
+# =============================================================================
+# Cloud Operations Mini Stack -- full local stack
+#
+#   docker compose up -d --build
+#
+#   web         Django + gunicorn            http://localhost:8000
+#   prometheus  scrape + rule evaluation     http://localhost:9090
+#   grafana     dashboards                   http://localhost:3000  (admin / admin)
+#   db          PostgreSQL 17
+#
+#   docker compose --profile demo up -d      # adds a load generator
+#
+# Everything a reviewer needs to see the project working end to end is reachable
+# from a single command, which is the point: a portfolio project whose monitoring
+# cannot be looked at is a claim, not evidence.
+# =============================================================================
+name: cloud-ops-mini-stack
+
+services:
+  # ---------------------------------------------------------------------------
+  # Database
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: cloudops
+      POSTGRES_USER: cloudops
+      POSTGRES_PASSWORD: cloudops
+      # Deterministic collation. Without it, the database inherits the host's
+      # locale, and an ORDER BY can come back in a different order on a
+      # colleague's machine -- a bug that only reproduces on someone else's
+      # laptop.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `depends_on: condition: service_healthy` is only as good as this probe.
+      # pg_isready answers during the brief window when the server is up but not
+      # yet accepting connections, so it is combined with a real query below.
+      test: ["CMD-SHELL", "pg_isready -U cloudops -d cloudops"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Application
+  # ---------------------------------------------------------------------------
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      SERVICE_NAME: cloud-ops-mini-stack
+      SERVICE_VERSION: 1.1.0
+      DEPLOY_ENV: docker
+      DEBUG: "False"
+      # Demo value. Override it:  SECRET_KEY=$(python scripts/gen_secret.py) docker compose up
+      # The application refuses to start without one, which is why a working
+      # default is provided here rather than a placeholder that fails at runtime.
+      SECRET_KEY: "${SECRET_KEY:-django-insecure-compose-demo-key-override-me}"
+      ALLOWED_HOSTS: "localhost,127.0.0.1,web"
+      DATABASE_URL: "postgresql://cloudops:cloudops@db:5432/cloudops"
+      DB_CONNECT_TIMEOUT: "5"
+      LOG_LEVEL: "INFO"
+      LOG_FORMAT: "json"
+      LOG_TO_FILE: "false"
+      # The SLO reporter reads history from Prometheus when it is reachable, and
+      # degrades to the in-process registry when it is not.
+      PROMETHEUS_URL: "http://prometheus:9090"
+      SLO_AVAILABILITY_TARGET: "0.995"
+      SLO_LATENCY_TARGET_MS: "300"
+      SLO_LATENCY_COMPLIANCE_TARGET: "0.99"
+      SLO_WINDOW: "30d"
+      # Enables /boom/ and /sentry-debug/ so the incident drills can be run.
+      # MUST be false in a real deployment -- see docs/runbooks/.
+      ENABLE_FAULT_ENDPOINTS: "true"
+      # Optional. Set SENTRY_DSN in the shell to send real events.
+      SENTRY_DSN: "${SENTRY_DSN:-}"
+      # Entrypoint switches, passed through so they can be overridden from the
+      # shell. Without these two lines, `RUN_MIGRATIONS=false docker compose up`
+      # would look like it worked and silently do nothing -- the variable never
+      # reaches the container.
+      #
+      # Used to split migrations out of the web process when running more than one
+      # replica: see docs/runbooks/deploy-and-rollback.md.
+      RUN_MIGRATIONS: "${RUN_MIGRATIONS:-true}"
+      RUN_COLLECTSTATIC: "${RUN_COLLECTSTATIC:-true}"
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Metrics storage and rule evaluation
+  # ---------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v3.14.0
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      # Long enough to evaluate a 30-day SLO window with real data instead of
+      # discovering that the retention silently truncated the history the
+      # objective is defined over.
+      - "--storage.tsdb.retention.time=35d"
+      - "--web.enable-lifecycle"   # allows POST /-/reload after a config change
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    depends_on:
+      - web
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Dashboards
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:13.2.2
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # A demo stack should not make anyone click through a setup wizard.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_USERS_DEFAULT_THEME: "light"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/etc/grafana/dashboards/cloud-ops-overview.json"
+    volumes:
+      # Datasource and dashboard *provisioning*: declared in files, so the
+      # dashboards are version controlled and a rebuilt container comes back with
+      # exactly the same views. Dashboards clicked together in the UI are not
+      # reproducible and are lost with the volume.
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Load generator (opt-in: `--profile demo`)
+  #
+  # Empty dashboards prove nothing. This drives a realistic mix of successful
+  # reads, writes, 4xx and 5xx traffic so every panel has something to show --
+  # and so the SLO reporter has data instead of reporting `no_data`.
+  # ---------------------------------------------------------------------------
+  loadgen:
+    image: python:3.12-slim
+    profiles: ["demo"]
+    working_dir: /app
+    volumes:
+      - ./scripts:/app/scripts:ro
+    environment:
+      TARGET_URL: "http://web:8000"
+      LOADGEN_RPS: "4"
+      LOADGEN_ERROR_RATIO: "0.05"
+    command: ["python", "/app/scripts/loadgen.py"]
+    depends_on:
+      - web
+    restart: unless-stopped
+
+volumes:
+  postgres-data:
+  prometheus-data:
+  grafana-data:

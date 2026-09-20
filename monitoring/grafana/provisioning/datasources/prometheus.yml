@@ -1,0 +1,30 @@
+# Grafana datasource provisioning.
+#
+# Declared in a file rather than clicked into the UI, so a rebuilt container
+# comes back with the same datasource. A datasource created by hand lives only in
+# the Grafana volume, which means it survives exactly until someone runs
+# `docker compose down -v` -- and then every dashboard is broken with no
+# explanation.
+
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    # The compose service name. Grafana runs in the same network namespace group,
+    # so it resolves `prometheus` directly.
+    url: http://prometheus:9090
+    uid: prometheus          # referenced by every panel in the dashboards
+    isDefault: true
+    editable: false
+    jsonData:
+      # Tells Grafana the scrape interval so `$__rate_interval` picks a window
+      # that always contains at least a few samples. Without it, rate() over a
+      # short dashboard range can produce gaps that look like an outage.
+      timeInterval: 15s
+      httpMethod: POST
+      # Prometheus 3.x serves the same API as 2.x; pinning the version keeps
+      # Grafana from probing for features the server does not have.
+      prometheusType: Prometheus
+      prometheusVersion: 3.14.0
