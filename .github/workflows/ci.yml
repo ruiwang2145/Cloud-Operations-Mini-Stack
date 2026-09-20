@@ -75,18 +75,26 @@ jobs:
         # A malformed rule file makes Prometheus refuse to start, which is a
         # spectacular way to lose monitoring while changing monitoring.
         #
+        # `--entrypoint promtool` is load-bearing. The image's entrypoint is
+        # /bin/prometheus, so `docker run ... prom/prometheus promtool check config`
+        # actually executes `/bin/prometheus promtool check config` and dies in
+        # flag parsing. The image ships promtool at /bin/promtool; selecting it
+        # explicitly is the only way to reach it.
+        #
         # Both scrape configs are checked, and both load the same rule file --
         # the native one exists so this can be verified without a container
-        # runtime, and it must not drift from the compose one.
+        # runtime, and it must not drift from the compose one. The `rule_files`
+        # patterns are relative, so promtool resolves them against the config
+        # file's own directory and these checks work from any working directory.
         run: |
           for config in prometheus.yml prometheus.local.yml; do
-            docker run --rm \
+            docker run --rm --entrypoint promtool \
               -v "$PWD/monitoring/prometheus:/work" -w /work \
-              prom/prometheus:v3.14.0 promtool check config "$config"
+              prom/prometheus:v3.14.0 check config "$config"
           done
-          docker run --rm \
+          docker run --rm --entrypoint promtool \
             -v "$PWD/monitoring/prometheus:/work" -w /work \
-            prom/prometheus:v3.14.0 promtool check rules alert_rules.yml
+            prom/prometheus:v3.14.0 check rules alert_rules.yml
 
       - name: Migrations are complete
         # A model change without a migration passes every test (Django builds the

@@ -8,7 +8,8 @@
 [![Grafana](https://img.shields.io/badge/grafana-13.2-F46800.svg)](https://grafana.com/)
 [![Docker](https://img.shields.io/badge/docker-compose-2496ED.svg)](https://docs.docker.com/compose/)
 [![Sentry](https://img.shields.io/badge/sentry-optional-362D59.svg)](https://sentry.io/)
-[![Tests](https://img.shields.io/badge/tests-159%20passing-brightgreen.svg)](#testing)
+[![CI](https://github.com/ruiwang2145/Cloud-Operations-Mini-Stack/actions/workflows/ci.yml/badge.svg)](https://github.com/ruiwang2145/Cloud-Operations-Mini-Stack/actions/workflows/ci.yml)
+[![Tests](https://img.shields.io/badge/tests-162%20passing-brightgreen.svg)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A Django REST API that is **operated** as well as written: health probes, RED
@@ -48,7 +49,7 @@ python scripts/run_drill.py --drill unhandled-exception
 | **Containerisation** — multi-stage build, non-root, healthcheck, entrypoint | `Dockerfile`, `docker-compose.yml` |
 | **Automation** — one-command setup, smoke test, incident drills | `scripts/` |
 | **Operational writing** — runbooks, known issues, incident drills, post-mortem template | [`docs/`](docs/) |
-| **Testing** — 159 tests including the guarantees above | `ops/tests/`, `tasks/tests/` |
+| **Testing** — 162 tests including the guarantees above | `ops/tests/`, `tasks/tests/` |
 
 ---
 
@@ -408,12 +409,12 @@ the failure modes that actually happen on a deploy. That gap is what this fills.
 ## Testing
 
 ```bash
-python -m pytest              # 159 tests
+python -m pytest              # 162 tests
 python -m ruff check .        # lint
 python scripts/render_rules.py --check
 ```
 
-159 tests, and the interesting ones assert the *operational* guarantees rather than
+162 tests, and the interesting ones assert the *operational* guarantees rather than
 the CRUD:
 
 | Test | Guarantee |
@@ -503,7 +504,7 @@ and wrong.
 
 | Verified | How |
 |---|---|
-| The application's behaviour and its operational guarantees | 159 tests, `ruff`, migration and rule-drift checks |
+| The application's behaviour and its operational guarantees | 162 tests, `ruff`, migration and rule-drift checks |
 | The deployed HTTP surface — ports, environment, migrations, every endpoint | `scripts/smoke_test.py`, 11 checks against a running instance |
 | Detection: failures are captured, counted once, correlated and alerted on | `scripts/run_drill.py` |
 | **The container image and the compose wiring** | `docker compose up -d --build`: four containers, `web` healthy in 10 s, all six endpoints 200, both Prometheus targets `up`, 9/9 rules `health=ok` |

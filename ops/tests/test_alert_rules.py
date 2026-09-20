@@ -21,6 +21,7 @@ objective, and a deployment that overrides it should regenerate them.
 from __future__ import annotations
 
 import importlib.util
+import re
 from pathlib import Path
 
 import pytest
@@ -29,6 +30,7 @@ from django.conf import settings
 RULES_PATH = Path(settings.BASE_DIR) / "monitoring" / "prometheus" / "alert_rules.yml"
 RENDER_SCRIPT = Path(settings.BASE_DIR) / "scripts" / "render_rules.py"
 PROMETHEUS_DIR = Path(settings.BASE_DIR) / "monitoring" / "prometheus"
+CI_WORKFLOW = Path(settings.BASE_DIR) / ".github" / "workflows" / "ci.yml"
 
 
 def read_exact(path: Path) -> str:
@@ -202,3 +204,56 @@ class TestScrapeConfigs:
         # must not reference it.
         assert "127.0.0.1:8000" in targets
         assert not any("web:" in target for target in targets)
+
+    def test_rule_files_are_relative(self):
+        # Prometheus resolves `rule_files` patterns against the config file's own
+        # directory, so a relative entry resolves in the container *and* on a
+        # developer's machine. An absolute `/etc/prometheus/...` path would only
+        # ever resolve inside the container -- which means `promtool check config`,
+        # the one check that can run before a deploy, could never pass. That is
+        # how this was found.
+        yaml = pytest.importorskip("yaml")
+        for name in ("prometheus.yml", "prometheus.local.yml"):
+            payload = yaml.safe_load((PROMETHEUS_DIR / name).read_text(encoding="utf-8"))
+            for entry in payload.get("rule_files") or []:
+                assert not entry.startswith("/"), f"{name}: {entry} is absolute"
+
+
+class TestCiPromtoolInvocation:
+    """CI has to be able to reach promtool inside the Prometheus image.
+
+    The image's entrypoint is ``/bin/prometheus``, so
+    ``docker run prom/prometheus promtool check config`` executes
+    ``/bin/prometheus promtool check config`` and dies in flag parsing. The
+    symptom is a red build pointing at a config file that is in fact valid --
+    which is why the assertion is about the invocation rather than the content.
+    """
+
+    def promtool_script(self) -> str:
+        yaml = pytest.importorskip("yaml")
+        workflow = yaml.safe_load(CI_WORKFLOW.read_text(encoding="utf-8"))
+        steps = [step for job in workflow["jobs"].values() for step in job.get("steps", [])]
+        step = next(
+            (s for s in steps if s.get("name") == "Prometheus config and rules are valid"),
+            None,
+        )
+        assert step is not None, "the promtool validation step is gone from CI"
+        return step["run"]
+
+    def test_every_docker_run_selects_the_promtool_entrypoint(self):
+        script = self.promtool_script()
+        runs = script.count("docker run")
+        switches = script.count("--entrypoint promtool")
+        assert runs, "the step no longer runs promtool at all"
+        assert switches == runs, (
+            f"{runs} `docker run` commands but {switches} `--entrypoint promtool` "
+            f"switches. The image's entrypoint is /bin/prometheus, so promtool has "
+            f"to be selected explicitly or the command never reaches it."
+        )
+
+    def test_promtool_is_never_passed_as_the_container_command(self):
+        script = self.promtool_script()
+        assert not re.search(r"prom/prometheus:\S+\s+promtool", script), (
+            "promtool is passed as the container command, which the image's "
+            "/bin/prometheus entrypoint rejects before it can run"
+        )
