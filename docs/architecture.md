@@ -323,6 +323,46 @@ name says exactly what it does.
 
 ---
 
+## Decision 16 — the container runs non-root, and its one writable directory is handed over explicitly
+
+**Decision.** The image creates an `appuser`, switches to it, and — immediately
+before the switch — creates `/app/staticfiles` and gives it to that user:
+
+```dockerfile
+RUN mkdir -p /app/staticfiles \
+    && chown appuser:appuser /app/staticfiles
+
+USER appuser
+```
+
+**Why.** The alternative is running as root, which turns any remote-code-execution
+bug in the application into root inside the container. That trade is not worth
+making for a service that needs write access to exactly one directory.
+
+The cost is that write access has to be arranged deliberately, because
+`WORKDIR /app` creates `/app` owned by **root** and `COPY --chown=appuser:appuser . .`
+re-owns only the files it copies — not the directory they land in. `.dockerignore`
+keeps `staticfiles/` out of the build context, so the directory does not exist in
+the image, and the entrypoint's `collectstatic` step cannot create it. The result
+is a container that starts, fails, and is restarted forever by
+`restart: unless-stopped` — with no error anywhere except the application log.
+
+Collecting static files at build time would remove the requirement entirely, and
+is not possible here: `settings.py` refuses to import without a `SECRET_KEY` (see
+[Decision 15](#decision-15--configuration-is-entirely-environment-driven)), and
+passing one as a build argument would write a secret into an image layer. Runtime
+collection is therefore load-bearing, which makes the directory's ownership
+load-bearing too.
+
+`ops/tests/test_container_contract.py` ties the two files together: it derives the
+container path of `STATIC_ROOT` from `settings.py` and fails if the `mkdir` and
+`chown` are missing, or if the `chown` appears after the `USER` line. The full
+story is in [incident-drills.md](incident-drills.md#run-c--the-container-path).
+
+**The invariant spans three files, and nothing in any one of them looks wrong.**
+
+---
+
 ## Deliberate non-decisions
 
 Things that are *not* here, and why. Each one is a reasonable next step rather than

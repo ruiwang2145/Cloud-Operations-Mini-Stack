@@ -171,6 +171,40 @@ def log_has_request_id(log_file: Path, request_id: str, message: str) -> tuple[b
     return found, detail
 
 
+def correlate(args, request_id: str, result: DrillResult) -> tuple[bool | None, str]:
+    """Correlate a drill's request id against whatever log sink this run has.
+
+    Returns ``(correlated, detail)`` where ``correlated`` is ``None`` when the
+    check does not apply.
+
+    The subtlety is that a *stale* log file looks exactly like a real one. A
+    container logs to stdout -- the correct behaviour, since the runtime collects
+    it -- so ``app.log`` is whatever an earlier native run left behind, and
+    searching it would report "not found" for a correlation that was never
+    applicable. Comparing the file's mtime against the start of the drill tells
+    the two apart: if nothing has written to it since this drill began, the file
+    is not this run's log, whatever it contains.
+    """
+    log_file = args.log_file
+    stale = log_file.stat().st_mtime < args.started_at - 1 if log_file.exists() else True
+    if stale:
+        result.notes.append(
+            f"No log for this run to search: `{log_file}` "
+            + ("does not exist" if not log_file.exists() else "was last written before the drill started")
+            + ", and this instance logs to stdout -- the correct behaviour in a container. "
+            f"Read `docker compose logs web` (or the equivalent) and grep for `{request_id}`."
+        )
+        return None, ""
+    correlated, detail = log_has_request_id(log_file, request_id, "unhandled_exception")
+    if not correlated:
+        result.notes.append(
+            f"`{log_file}` is being written, but carries no line for `{request_id}`. "
+            f"If the service under test is not the one writing this file, it is looking in "
+            f"the wrong place."
+        )
+    return correlated, detail
+
+
 # --------------------------------------------------------------------------- #
 # Drills
 # --------------------------------------------------------------------------- #
@@ -183,6 +217,9 @@ def drill_unhandled_exception(runner: Runner, args) -> DrillResult:
     )
 
     runner.request_id = f"drill-boom-{random.randint(1000, 9999)}"
+    # Printed first on purpose: it is the key that ties this injected failure to a
+    # log line, and without it a reader of the report has nothing to grep for.
+    result.evidence.append(f"request id sent = {runner.request_id}")
     before = Metrics(runner.request("GET", "/metrics").body)
     baseline = before.value(
         "app_errors_total", endpoint="/boom/", error_type="RuntimeError"
@@ -224,9 +261,7 @@ def drill_unhandled_exception(runner: Runner, args) -> DrillResult:
             f"Two observers are counting the same failure."
         )
 
-    result.correlated, detail = log_has_request_id(
-        args.log_file, runner.request_id, "unhandled_exception"
-    )
+    result.correlated, detail = correlate(args, runner.request_id, result)
     if detail:
         result.evidence.append(f"log line: {detail}")
 
@@ -243,6 +278,7 @@ def drill_sentry_path(runner: Runner, args) -> DrillResult:
     )
 
     runner.request_id = f"drill-sentry-{random.randint(1000, 9999)}"
+    result.evidence.append(f"request id sent = {runner.request_id}")
     before = Metrics(runner.request("GET", "/metrics").body)
     baseline = before.value(
         "app_errors_total", endpoint="/sentry-debug/", error_type="ZeroDivisionError"
@@ -275,9 +311,7 @@ def drill_sentry_path(runner: Runner, args) -> DrillResult:
         f"(delta {counted - baseline:g})"
     )
 
-    result.correlated, detail = log_has_request_id(
-        args.log_file, runner.request_id, "unhandled_exception"
-    )
+    result.correlated, detail = correlate(args, runner.request_id, result)
     if detail:
         result.evidence.append(f"log line: {detail}")
 
@@ -395,6 +429,9 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
+    # Stamped here so correlate() can tell a log file this run is writing from one
+    # an earlier run left behind.
+    args.started_at = time.time()
 
     runner = Runner(base_url=args.base_url)
     try:

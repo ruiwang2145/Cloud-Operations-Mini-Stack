@@ -8,7 +8,7 @@
 [![Grafana](https://img.shields.io/badge/grafana-13.2-F46800.svg)](https://grafana.com/)
 [![Docker](https://img.shields.io/badge/docker-compose-2496ED.svg)](https://docs.docker.com/compose/)
 [![Sentry](https://img.shields.io/badge/sentry-optional-362D59.svg)](https://sentry.io/)
-[![Tests](https://img.shields.io/badge/tests-136%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-159%20passing-brightgreen.svg)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A Django REST API that is **operated** as well as written: health probes, RED
@@ -48,7 +48,7 @@ python scripts/run_drill.py --drill unhandled-exception
 | **Containerisation** — multi-stage build, non-root, healthcheck, entrypoint | `Dockerfile`, `docker-compose.yml` |
 | **Automation** — one-command setup, smoke test, incident drills | `scripts/` |
 | **Operational writing** — runbooks, known issues, incident drills, post-mortem template | [`docs/`](docs/) |
-| **Testing** — 136 tests including the guarantees above | `ops/tests/`, `tasks/tests/` |
+| **Testing** — 159 tests including the guarantees above | `ops/tests/`, `tasks/tests/` |
 
 ---
 
@@ -408,12 +408,12 @@ the failure modes that actually happen on a deploy. That gap is what this fills.
 ## Testing
 
 ```bash
-python -m pytest              # 136 tests
+python -m pytest              # 159 tests
 python -m ruff check .        # lint
 python scripts/render_rules.py --check
 ```
 
-136 tests, and the interesting ones assert the *operational* guarantees rather than
+159 tests, and the interesting ones assert the *operational* guarantees rather than
 the CRUD:
 
 | Test | Guarantee |
@@ -460,7 +460,7 @@ the CRUD:
 ├── scripts/                     bootstrap, smoke test, drills, loadgen
 ├── docs/
 │   ├── SLO.md                   objectives, SLIs, error budget, policy
-│   ├── architecture.md          15 design decisions and what was not built
+│   ├── architecture.md          16 design decisions and what was not built
 │   ├── KNOWN_ISSUES.md          15 known limitations
 │   ├── incident-drills.md       measured drill results, including the gaps
 │   ├── native-monitoring.md     running Prometheus + Grafana without Docker
@@ -503,9 +503,10 @@ and wrong.
 
 | Verified | How |
 |---|---|
-| The application's behaviour and its operational guarantees | 136 tests, `ruff`, migration and rule-drift checks |
+| The application's behaviour and its operational guarantees | 159 tests, `ruff`, migration and rule-drift checks |
 | The deployed HTTP surface — ports, environment, migrations, every endpoint | `scripts/smoke_test.py`, 11 checks against a running instance |
 | Detection: failures are captured, counted once, correlated and alerted on | `scripts/run_drill.py` |
+| **The container image and the compose wiring** | `docker compose up -d --build`: four containers, `web` healthy in 10 s, all six endpoints 200, both Prometheus targets `up`, 9/9 rules `health=ok` |
 | **Prometheus really scrapes the application** | native run, both targets `up` at a 15 s interval |
 | **Every alert expression is valid against real data** | all 9 rules report `health=ok`; `promtool check rules` passes |
 | **Alerts fire when the SLO is breached, and not before** | `AvailabilityBudgetBurnFast` and `HighErrorRate` observed firing; the rest correctly inactive |
@@ -514,9 +515,9 @@ and wrong.
 
 | **Not** verified here | Covered by | See |
 |---|---|---|
-| The container image and compose wiring | CI: `docker-build` and `end-to-end` jobs | — |
 | Alert *delivery* — nothing is notified | nothing; this is a real gap | [KNOWN_ISSUES #8](docs/KNOWN_ISSUES.md) |
 | Sentry receiving a real event | nothing; no DSN is configured | [KNOWN_ISSUES #12](docs/KNOWN_ISSUES.md) |
+| Shipping container logs to a store | nothing; the container writes JSON to stdout | [`docs/incident-drills.md`](docs/incident-drills.md) |
 | Anything behind a load balancer (TLS, proxy buffering, real client latency) | nothing; this is a demo service | — |
 | Multi-worker metrics | nothing; deliberately one worker | [KNOWN_ISSUES #1](docs/KNOWN_ISSUES.md) |
 

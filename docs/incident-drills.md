@@ -49,7 +49,7 @@ Docker.
 
 ## Results
 
-Two runs are recorded below.
+Three runs are recorded below.
 
 **Run A — drill scripts, direct metric polling.**
 `manage.py runserver` (single process), SQLite, `DEBUG=True`, Sentry disabled (no
@@ -64,6 +64,14 @@ application every 15 seconds. Recorded 2026-09-20. This is the run that answers
 the questions Run A cannot: whether the rules evaluate against real data, whether
 they actually fire, and whether the dashboards render. Its results are in
 [Run B](#run-b--the-alerting-path-under-a-real-scrape-interval).
+
+**Run C — the container path.**
+The real thing: `docker compose up -d --build`, four containers, the application
+served by gunicorn from the built image. Recorded 2026-09-20. This is the run that
+answers the remaining question — whether the `Dockerfile`, the entrypoint, the
+healthcheck and compose service discovery actually work — and it is the one that
+**failed first and had to be fixed**. See
+[Run C](#run-c--the-container-path).
 
 ### Drill: unhandled exception is captured, counted and correlated
 
@@ -320,13 +328,161 @@ a designed test, but a real one.
 
 ---
 
+## Run C — the container path
+
+Runs A and B used native binaries and a SQLite database. Neither of them built the
+image, started the entrypoint, ran a migration through compose, or let a
+healthcheck decide whether the service was ready. This run does all of that, with
+`docker compose up -d --build`.
+
+**Environment.** Windows 10 Home (Build 19044) — Docker Desktop is not supported
+here (it requires Build 19045, and Home has no Hyper-V), so this is WSL2 with
+Docker Engine 29.8.1 on an imported Ubuntu 24.04 rootfs. Four containers:
+`db` (`postgres:17-alpine`), `web` (the built image), `prometheus` (`v3.14.0`),
+`grafana` (`13.2.2`).
+
+### It did not work the first time
+
+Worth leading with, because it is the most useful thing in this document.
+
+The first `docker compose up` started all four containers. Port 9090 answered 200
+and so did 3000 — but 8000 never did:
+
+```
+[entrypoint] collecting static files
+Traceback (most recent call last):
+  ...
+PermissionError: [Errno 13] Permission denied: '/app/staticfiles'
+[entrypoint] waiting for the database to accept connections     <- second start
+```
+
+That last line is the tell. `collectstatic` failed, and then the entrypoint
+started *again* — so the container was not dead, it was in a crash loop, and
+`restart: unless-stopped` was faithfully restarting it every couple of seconds.
+
+**Root cause: three files, each individually correct.**
+
+| File | What it does right | Why the combination fails |
+|---|---|---|
+| `Dockerfile` | `WORKDIR /app`, then `COPY --chown=appuser:appuser . .` | `WORKDIR` creates `/app` as **root**, and `COPY --chown` re-owns the files it copies — *not the directory they land in*. So `appuser` cannot create anything inside `/app` |
+| `.dockerignore` | Excludes `staticfiles/`, keeping the build context small | The directory therefore does not exist in the image |
+| `scripts/docker-entrypoint.sh` | `set -eu`, then `collectstatic` as step 4 | Correct: a failed setup step must stop the start. Which it does |
+| `docker-compose.yml` | `restart: unless-stopped` | Turns "exits after two seconds" into a loop that never converges |
+
+Nothing here is a typo. Every file is defensible on its own, and the failure only
+exists in the seam between them.
+
+**The fix**, before the `USER` switch:
+
+```dockerfile
+RUN mkdir -p /app/staticfiles \
+    && chown appuser:appuser /app/staticfiles
+```
+
+One directory is handed over; the rest of the source tree stays read-only to the
+process.
+
+**Why not collect static files at build time.** That is the more orthodox answer —
+an immutable image, a faster start, and a process that never needs write access.
+It is not available here: `settings.py` raises `RuntimeError` when `SECRET_KEY` is
+absent and `DEBUG` is off, and the build has no `SECRET_KEY`. Passing one as a
+build argument would bake a secret into an image layer. Runtime collection is
+therefore the only viable design for this project, which makes the directory's
+writability load-bearing rather than incidental. The reasoning lives in a comment
+in the `Dockerfile`.
+
+**A regression guard.** `ops/tests/test_container_contract.py` (23 tests) pins the
+cross-file invariants that a container runtime enforces but a unit test normally
+cannot see. The important one ties the `Dockerfile` to `settings.py`: it derives
+the container path of `STATIC_ROOT`, asserts that both the `mkdir` and the `chown`
+are present, and asserts that the `chown` precedes the `USER` line — because the
+ordering *is* the fix. Deleting those two lines fails three tests, by name.
+
+### After the fix
+
+```
+#18 [runtime 8/8] RUN mkdir -p /app/staticfiles     && chown appuser:appuser /app/staticfiles
+...
+[entrypoint] database reachable after 1 attempt(s)
+[entrypoint] applying database migrations
+  No migrations to apply.
+[entrypoint] collecting static files
+154 static files copied to '/app/staticfiles', 145 post-processed.
+[entrypoint] starting: gunicorn my_cloudapp.wsgi:application --bind 0.0.0.0:8000 --workers 1 ...
+[INFO] Listening at: http://0.0.0.0:8000 (1)
+```
+
+`web` reported `healthy` **10 seconds** after the recreate — the healthcheck's
+start period doing its job rather than declaring the service up while the
+entrypoint was still running.
+
+### What Run C verifies
+
+| Check | Result |
+|---|---|
+| `docker compose ps` | `db` healthy; `web`, `prometheus`, `grafana` up, ports 8000 / 9090 / 3000 published |
+| Every endpoint, probed **inside** the container | `/healthz/` 200 · `/readyz/` 200 · `/version/` 200 · `/api/tasks/` 200 · `/metrics` 200 · `/api/slo/` 200 |
+| Prometheus targets | `web:8000` **up**, `localhost:9090` **up** |
+| Prometheus rule health | 9 of 9 rules `health=ok` |
+| Grafana | `/api/health` → `database: ok`, version 13.2.2 |
+| `scripts/smoke_test.py` from the host | **11 passed, 0 failed** |
+| `run_drill.py --drill unhandled-exception` | **pass**, detected in 0.02 s, counter delta exactly 1 |
+| `run_drill.py --drill unknown-path-scan` | **pass**, 200 distinct URLs → 1 `unmatched` series |
+
+The probes are run *inside* the container on purpose: if something is broken, the
+first question is whether it is the application or the path to it, and probing
+from both sides answers that immediately.
+
+**One transient worth recording.** Immediately after the recreate, Prometheus
+reported one target `down`. That is correct and expected — the scrape landed in
+the window where `web` was restarting — and the next cycle showed both `up`. A
+monitoring stack that reports a restart as an outage for one scrape interval is
+behaving properly; one that hides it would not be.
+
+### Log correlation in the container
+
+The drill reports `Log correlation: not checked` here, and that is the honest
+answer: the container logs to **stdout**, which is the correct behaviour when the
+runtime collects logs, so there is no file to search. (The `app.log` in the
+working tree is left over from Run B; `run_drill.py` now compares the file's mtime
+against the start of the drill and says so explicitly instead of reporting a
+misleading "not found".)
+
+The same structured envelope is visible in `docker compose logs web`:
+
+```json
+{"ts": "2026-09-20T16:14:07.469Z", "level": "INFO", "logger": "app.access", "message": "http_request", "service": "cloud-ops-mini-stack", "version": "1.1.0", "request_id": "22ec9746948b48bf", "http": {"method": "GET", "endpoint": "/healthz/", "path": "/healthz/", "status": 200}, "duration_ms": 10.207, "client_ip": "127.0.0.1", "user_agent": "curl/8.14.1", "user_id": null}
+```
+
+Same logger, same `request_id`, same fields as Run A — the pipeline is identical,
+only the sink differs.
+
+### An environment caveat, for anyone reproducing this
+
+Docker Engine 29 defaults to the nftables firewall backend, and the WSL2 kernel
+shipped by the (now frozen) `wsl_update_x64.msi` is 5.10.16 from 2021, whose
+nftables cannot create a NAT chain:
+
+```
+failed to add jump rules to ipv4 NAT table:
+CHAIN_ADD failed (No such file or directory): chain PREROUTING
+```
+
+Pinning `iptables` to the legacy xtables path fixes it
+(`update-alternatives --set iptables /usr/sbin/iptables-legacy`). Nothing about
+this project depends on it — it is a property of running a 2026 Docker on a 2021
+kernel, and it is recorded here because the error message points at the network
+stack rather than at the kernel version.
+
+---
+
 ## What is *not* covered
 
 | Gap | Why | Impact |
 |---|---|---|
 | Alert delivery | No Alertmanager in this stack | Alerts **fire** and are visible at `/alerts`; nothing is notified. See [KNOWN_ISSUES #8](KNOWN_ISSUES.md) |
 | Sentry event delivery | No DSN configured in this environment | The integration is unit-tested; the network hop is not. See [KNOWN_ISSUES #12](KNOWN_ISSUES.md) |
-| Container behaviour | Run B used native binaries, not the image | The `Dockerfile`, the entrypoint, the healthcheck and compose service discovery are unverified here. CI's `docker-build` and `end-to-end` jobs cover them |
+| Log *shipping* from the container | No collector in this stack | The container emits structured JSON to stdout (verified in Run C); nothing forwards it to a store. Locally, `docker compose logs` is the only reader |
 | Detection latency behind a load balancer | Nothing sits in front of the service | The 15 s scrape interval is included in Run B; network latency and proxy buffering are not |
 | Multi-worker behaviour | Single worker by design | See [KNOWN_ISSUES #1](KNOWN_ISSUES.md) |
 | Disk exhaustion | No `node_exporter` | See [KNOWN_ISSUES #9](KNOWN_ISSUES.md) |
