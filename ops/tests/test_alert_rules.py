@@ -28,6 +28,7 @@ from django.conf import settings
 
 RULES_PATH = Path(settings.BASE_DIR) / "monitoring" / "prometheus" / "alert_rules.yml"
 RENDER_SCRIPT = Path(settings.BASE_DIR) / "scripts" / "render_rules.py"
+PROMETHEUS_DIR = Path(settings.BASE_DIR) / "monitoring" / "prometheus"
 
 
 def read_exact(path: Path) -> str:
@@ -142,3 +143,62 @@ class TestAlertRules:
         assert f"{objective:.3%}" in rendered
         # The budget is the divisor in the burn-rate expressions.
         assert f"{1.0 - objective:g}" in rendered
+
+
+class TestScrapeConfigs:
+    """The container and native configs must not drift apart.
+
+    `prometheus.yml` (compose, target `web:8000`) and `prometheus.local.yml`
+    (native, target `127.0.0.1:8000`) exist because the target hostname differs.
+    Everything else about them should be identical, and the thing that matters
+    most is that both load the SAME generated rule file -- a native run that
+    quietly loaded stale rules would produce exactly the kind of confident,
+    wrong evidence a drill is supposed to prevent.
+    """
+
+    def test_both_configs_exist(self):
+        for name in ("prometheus.yml", "prometheus.local.yml"):
+            assert (PROMETHEUS_DIR / name).exists(), name
+
+    def test_both_load_the_generated_rules(self):
+        yaml = pytest.importorskip("yaml")
+        for name in ("prometheus.yml", "prometheus.local.yml"):
+            payload = yaml.safe_load((PROMETHEUS_DIR / name).read_text(encoding="utf-8"))
+            rule_files = payload.get("rule_files") or []
+            assert rule_files, f"{name} loads no rule files"
+            assert any("alert_rules.yml" in entry for entry in rule_files), name
+
+    def test_neither_config_uses_a_trailing_slash_on_the_metrics_path(self):
+        # django-prometheus registers the view at `metrics` and Django's
+        # APPEND_SLASH does not strip slashes, so `/metrics/` returns 404 and the
+        # target silently stays down while the config looks perfectly correct.
+        yaml = pytest.importorskip("yaml")
+        for name in ("prometheus.yml", "prometheus.local.yml"):
+            payload = yaml.safe_load((PROMETHEUS_DIR / name).read_text(encoding="utf-8"))
+            for job in payload.get("scrape_configs") or []:
+                path = job.get("metrics_path", "/metrics")
+                assert not path.endswith("/"), f"{name}: job {job.get('job_name')} -> {path}"
+
+    def test_both_scrape_intervals_match_the_slo_cache(self):
+        # There is no point scraping faster than the SLO report refreshes, and no
+        # point caching longer than the scrape interval: keeping the two equal
+        # means a dashboard and /api/slo/ never disagree by more than one cycle.
+        yaml = pytest.importorskip("yaml")
+        expected = f"{settings.SLO_CACHE_SECONDS}s"
+        for name in ("prometheus.yml", "prometheus.local.yml"):
+            payload = yaml.safe_load((PROMETHEUS_DIR / name).read_text(encoding="utf-8"))
+            assert payload["global"]["scrape_interval"] == expected, name
+
+    def test_the_local_config_targets_the_loopback(self):
+        yaml = pytest.importorskip("yaml")
+        payload = yaml.safe_load((PROMETHEUS_DIR / "prometheus.local.yml").read_text(encoding="utf-8"))
+        targets = [
+            target
+            for job in payload["scrape_configs"]
+            for config in job.get("static_configs", [])
+            for target in config.get("targets", [])
+        ]
+        # `web:8000` only resolves inside the compose network, so a native run
+        # must not reference it.
+        assert "127.0.0.1:8000" in targets
+        assert not any("web:" in target for target in targets)

@@ -336,16 +336,30 @@ def drill_readiness_failure(runner: Runner, args) -> DrillResult:
     """Cannot be triggered over HTTP -- it needs the dependency to break."""
     result = DrillResult(
         name="readiness-failure",
-        title="Readiness probe takes the instance out of rotation (manual)",
-        injected="stop PostgreSQL, or point `DATABASE_URL` at a dead host",
+        title="Readiness probe takes the instance out of rotation",
+        injected="`DATABASE_URL` pointed at a dead PostgreSQL endpoint",
         detected="`/readyz/` returns 503; `app_readiness_failures_total` rises",
     )
     result.notes.append(
         "This drill cannot be driven from outside the service: it requires a dependency to "
-        "actually fail. Procedure: stop the database container, then poll `/readyz/` until it "
-        "returns 503, and confirm `up` stayed 1 and `app_readiness_failures_total` increased. "
-        "The instance must stay alive -- liveness is what would trigger a restart, and it "
-        "deliberately does not touch the database."
+        "actually fail, and the service has to stay up while it does. `manage.py runserver` "
+        "cannot be used -- it calls check_migrations() at startup, which needs a connection, "
+        "so the process exits before it can answer /readyz/. gunicorn does no such check, "
+        "which is why a production container can be up-but-not-ready; "
+        "`scripts/serve_for_drills.py` reproduces that behaviour with the standard library."
+    )
+    result.notes.append(
+        "Procedure: start the service with "
+        "`DATABASE_URL=postgresql://bad:bad@127.0.0.1:59999/bad python scripts/serve_for_drills.py`, "
+        "then poll `/readyz/` until it returns 503 and confirm `/healthz/` stays 200, "
+        "`app_readiness_failures_total` increases, and `up` stays 1. The instance must stay "
+        "alive -- liveness is what would trigger a restart, and it deliberately does not "
+        "touch the database."
+    )
+    result.notes.append(
+        "Recorded result: 8 probes, all 503, each taking exactly DB_CONNECT_TIMEOUT (5.01 s); "
+        "counter 9.0; /healthz/ 200 throughout; `ReadinessCheckFailing` fired in Prometheus. "
+        "See docs/incident-drills.md."
     )
     response = runner.request("GET", "/readyz/")
     result.evidence.append(

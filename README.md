@@ -8,7 +8,7 @@
 [![Grafana](https://img.shields.io/badge/grafana-13.2-F46800.svg)](https://grafana.com/)
 [![Docker](https://img.shields.io/badge/docker-compose-2496ED.svg)](https://docs.docker.com/compose/)
 [![Sentry](https://img.shields.io/badge/sentry-optional-362D59.svg)](https://sentry.io/)
-[![Tests](https://img.shields.io/badge/tests-130%20passing-brightgreen.svg)](#testing)
+[![Tests](https://img.shields.io/badge/tests-136%20passing-brightgreen.svg)](#testing)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
 A Django REST API that is **operated** as well as written: health probes, RED
@@ -48,7 +48,7 @@ python scripts/run_drill.py --drill unhandled-exception
 | **Containerisation** — multi-stage build, non-root, healthcheck, entrypoint | `Dockerfile`, `docker-compose.yml` |
 | **Automation** — one-command setup, smoke test, incident drills | `scripts/` |
 | **Operational writing** — runbooks, known issues, incident drills, post-mortem template | [`docs/`](docs/) |
-| **Testing** — 130 tests including the guarantees above | `ops/tests/`, `tasks/tests/` |
+| **Testing** — 136 tests including the guarantees above | `ops/tests/`, `tasks/tests/` |
 
 ---
 
@@ -123,6 +123,26 @@ default, so there is no database to install.
 .venv/bin/python scripts/smoke_test.py
 .venv/bin/python -m pytest
 ```
+
+### Without Docker, with the full monitoring stack
+
+Prometheus and Grafana both ship standalone binaries, so the alerting and
+dashboard path can be verified without a container runtime — no administrator
+rights and no reboot. This is how the results in
+[`docs/incident-drills.md`](docs/incident-drills.md) were produced.
+
+```bash
+# check the configs before running them
+promtool check config monitoring/prometheus/prometheus.local.yml
+promtool check rules  monitoring/prometheus/alert_rules.yml
+
+# then start Prometheus against the local instance
+prometheus --config.file=monitoring/prometheus/prometheus.local.yml \
+           --storage.tsdb.path=/tmp/prometheus-data --web.enable-lifecycle
+```
+
+Full recipe, including Grafana provisioning:
+[`docs/native-monitoring.md`](docs/native-monitoring.md).
 
 ---
 
@@ -321,9 +341,22 @@ python scripts/run_drill.py --drill readiness-failure
 ```
 
 Each injects one failure, polls the metrics until it appears, measures the time to
-detection, and correlates the log line by request id. Results — with the numbers
-actually measured — are in [`docs/incident-drills.md`](docs/incident-drills.md),
-including the gaps.
+detection, and correlates the log line by request id.
+
+The drills were also run against a **real Prometheus and Grafana**, scraping every
+15 seconds, and the results are recorded in
+[`docs/incident-drills.md`](docs/incident-drills.md). That run answered the
+questions the scripts cannot:
+
+| Verified | Result |
+|---|---|
+| Every rule expression executes against real data | all 9 rules report `health=ok` |
+| Alerts fire when the SLO is breached, and only then | `AvailabilityBudgetBurnFast` and `HighErrorRate` **firing** at 23.3× and 15.5% |
+| Every dashboard panel renders | **27 of 27** panel queries returned data |
+| Readiness fails closed while liveness survives | `/readyz/` 503 in exactly `DB_CONNECT_TIMEOUT`; `/healthz/` 200 throughout |
+
+The log also records what the run did **not** cover: container behaviour, alert
+delivery, and anything behind a load balancer.
 
 ### Known issues
 
@@ -348,6 +381,7 @@ A project that lists what it does not do is more credible than one that does not
 | `scripts/run_drill.py` | Incident drills with measured detection latency |
 | `scripts/render_rules.py` | Generate alert rules from the SLO definition |
 | `scripts/loadgen.py` | Realistic traffic mix so the dashboards are not empty |
+| `scripts/serve_for_drills.py` | Serve without startup database checks, so the readiness drill is possible |
 | `scripts/gen_secret.py` | Fresh `SECRET_KEY` |
 | `scripts/docker-entrypoint.sh` | Wait for the database, migrate, collectstatic, exec |
 
@@ -374,12 +408,12 @@ the failure modes that actually happen on a deploy. That gap is what this fills.
 ## Testing
 
 ```bash
-python -m pytest              # 130 tests
+python -m pytest              # 136 tests
 python -m ruff check .        # lint
 python scripts/render_rules.py --check
 ```
 
-130 tests, and the interesting ones assert the *operational* guarantees rather than
+136 tests, and the interesting ones assert the *operational* guarantees rather than
 the CRUD:
 
 | Test | Guarantee |
@@ -389,7 +423,7 @@ the CRUD:
 | `ops/tests/test_probes.py` | Liveness survives a database outage; `/readyz/` fails closed |
 | `ops/tests/test_slo.py` | Burn-rate arithmetic, including the division-by-zero edges |
 | `ops/tests/test_dashboards.py` | Every dashboard query references a metric that exists |
-| `ops/tests/test_alert_rules.py` | Alert rules match the SLO definition; runbooks exist |
+| `ops/tests/test_alert_rules.py` | Alert rules match the SLO definition; runbooks exist; both scrape configs load the same rules |
 | `ops/tests/test_logging.py` | Log output stays valid JSON when messages contain quotes |
 | `ops/tests/test_fault_endpoints.py` | Fault endpoints default to off |
 | `tasks/tests/test_api.py` | Query count does not grow with the number of rows |
@@ -420,13 +454,16 @@ the CRUD:
 │   └── tests/test_api.py
 ├── monitoring/
 │   ├── prometheus/              scrape config + generated alert rules
+│   │   ├── prometheus.yml           compose target (web:8000)
+│   │   └── prometheus.local.yml     native target (127.0.0.1:8000)
 │   └── grafana/                 provisioning + 2 dashboards
 ├── scripts/                     bootstrap, smoke test, drills, loadgen
 ├── docs/
 │   ├── SLO.md                   objectives, SLIs, error budget, policy
 │   ├── architecture.md          15 design decisions and what was not built
 │   ├── KNOWN_ISSUES.md          15 known limitations
-│   ├── incident-drills.md       measured drill results
+│   ├── incident-drills.md       measured drill results, including the gaps
+│   ├── native-monitoring.md     running Prometheus + Grafana without Docker
 │   ├── post-incident-template.md
 │   ├── DEMO.md                  five-minute walkthrough
 │   └── runbooks/                7 runbooks
@@ -455,6 +492,36 @@ production. [`.env.example`](.env.example) documents every variable.
 | `LOG_FORMAT` | `json` | `console` for a readable terminal |
 | `LOG_TO_FILE` | `True` | Set `false` in containers; stdout is collected there |
 | `ENABLE_FAULT_ENDPOINTS` | `False` | **Must stay false in production** |
+
+---
+
+## What is verified, and what is not
+
+Being precise about this matters more than the claim itself. "Tested" covers
+several different things, and conflating them is how a project ends up confident
+and wrong.
+
+| Verified | How |
+|---|---|
+| The application's behaviour and its operational guarantees | 136 tests, `ruff`, migration and rule-drift checks |
+| The deployed HTTP surface — ports, environment, migrations, every endpoint | `scripts/smoke_test.py`, 11 checks against a running instance |
+| Detection: failures are captured, counted once, correlated and alerted on | `scripts/run_drill.py` |
+| **Prometheus really scrapes the application** | native run, both targets `up` at a 15 s interval |
+| **Every alert expression is valid against real data** | all 9 rules report `health=ok`; `promtool check rules` passes |
+| **Alerts fire when the SLO is breached, and not before** | `AvailabilityBudgetBurnFast` and `HighErrorRate` observed firing; the rest correctly inactive |
+| **Every dashboard panel renders** | 27 of 27 panel queries executed through Grafana returned data |
+| **Readiness fails closed while liveness survives a database outage** | end-to-end: `/readyz/` 503 in exactly `DB_CONNECT_TIMEOUT`, `/healthz/` 200 throughout |
+
+| **Not** verified here | Covered by | See |
+|---|---|---|
+| The container image and compose wiring | CI: `docker-build` and `end-to-end` jobs | — |
+| Alert *delivery* — nothing is notified | nothing; this is a real gap | [KNOWN_ISSUES #8](docs/KNOWN_ISSUES.md) |
+| Sentry receiving a real event | nothing; no DSN is configured | [KNOWN_ISSUES #12](docs/KNOWN_ISSUES.md) |
+| Anything behind a load balancer (TLS, proxy buffering, real client latency) | nothing; this is a demo service | — |
+| Multi-worker metrics | nothing; deliberately one worker | [KNOWN_ISSUES #1](docs/KNOWN_ISSUES.md) |
+
+Full detail, including the numbers and the environment each run used:
+[`docs/incident-drills.md`](docs/incident-drills.md).
 
 ---
 

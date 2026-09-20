@@ -1,0 +1,53 @@
+# Prometheus configuration for running WITHOUT Docker.
+#
+#     prometheus --config.file=monitoring/prometheus/prometheus.local.yml \
+#                --storage.tsdb.path=<somewhere writable>
+#
+# Why this file exists
+# --------------------
+# `prometheus.yml` targets `web:8000`, which only resolves inside the compose
+# network. Everything else about the two files is the same -- same scrape
+# interval, same job name, same alert rules -- so this is the only difference
+# that has to be maintained.
+#
+# The point of running Prometheus natively is to verify the parts that are easy
+# to get wrong and impossible to see in a config file: that the application
+# really exports the metric names the rules and dashboards reference, that every
+# rule expression is valid against real data, and that the dashboards render.
+# That verification needs no containers, no administrator rights and no reboot.
+#
+# See docs/native-monitoring.md for the full recipe.
+
+global:
+  # Must match SLO_CACHE_SECONDS in the application (15). Scraping faster than the
+  # SLO report refreshes gains nothing; caching longer than the scrape interval
+  # lets a dashboard and /api/slo/ disagree.
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    service: cloud-ops-mini-stack
+    environment: native
+
+rule_files:
+  # Resolved relative to THIS FILE's directory, which is why the path is bare.
+  # Verified with `promtool check config monitoring/prometheus/prometheus.local.yml`.
+  - "alert_rules.yml"
+
+scrape_configs:
+  - job_name: cloud-ops-mini-stack
+    # No trailing slash: the view is registered at `metrics` and Django's
+    # APPEND_SLASH does not strip slashes, so `/metrics/` returns 404 and the
+    # target silently stays down while the config looks correct.
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
+        labels:
+          env: native
+          tier: application
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["127.0.0.1:9090"]
+        labels:
+          tier: monitoring

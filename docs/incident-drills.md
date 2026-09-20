@@ -28,7 +28,11 @@ export ENABLE_FAULT_ENDPOINTS=True
 python scripts/run_drill.py --drill unhandled-exception
 python scripts/run_drill.py --drill sentry-path
 python scripts/run_drill.py --drill unknown-path-scan
-python scripts/run_drill.py --drill readiness-failure     # prints the manual steps
+
+# The readiness drill needs the service up and its database down, which
+# `runserver` cannot do. Start the service with scripts/serve_for_drills.py
+# instead, then run the drill against it. See the drill below.
+python scripts/run_drill.py --drill readiness-failure
 
 # Machine-readable, for CI.
 python scripts/run_drill.py --drill unhandled-exception --json
@@ -37,17 +41,29 @@ python scripts/run_drill.py --drill unhandled-exception --json
 Each drill exits non-zero if it fails, so it can gate a pipeline. `run_drill.py`
 produces a markdown section identical in shape to the ones below.
 
+To verify the *alerting* path rather than just the metrics, Prometheus has to be
+running. [native-monitoring.md](native-monitoring.md) shows how to do that without
+Docker.
+
 ---
 
 ## Results
 
-**Environment:** local development, `manage.py runserver` (single process),
-SQLite, `DEBUG=True`, Sentry disabled (no DSN).
-**Recorded:** 2026-09-20.
+Two runs are recorded below.
 
-A single-process, single-worker environment is the *easiest* case. Latency to
-detection will be higher behind a real scrape interval (15 s in this stack), and
-that difference is the point of recording the environment alongside the number.
+**Run A — drill scripts, direct metric polling.**
+`manage.py runserver` (single process), SQLite, `DEBUG=True`, Sentry disabled (no
+DSN). Recorded 2026-09-20. A single-process environment is the *easiest* case:
+detection latency is measured by polling `/metrics` directly, with no scrape
+interval in the path. These numbers are a **floor**, not an expectation.
+
+**Run B — full monitoring stack, native.**
+Prometheus 3.14.0 and Grafana 13.2.2 running natively (no Docker, no container
+runtime — see [native-monitoring.md](native-monitoring.md)), scraping the
+application every 15 seconds. Recorded 2026-09-20. This is the run that answers
+the questions Run A cannot: whether the rules evaluate against real data, whether
+they actually fire, and whether the dashboards render. Its results are in
+[Run B](#run-b--the-alerting-path-under-a-real-scrape-interval).
 
 ### Drill: unhandled exception is captured, counted and correlated
 
@@ -123,59 +139,184 @@ Prometheus server down slowly: label values that grow with input. It cannot be
 tested in production (the damage is already done by the time it is visible), which
 is why it is a drill.
 
-### Drill: readiness probe takes the instance out of rotation (manual)
+### Drill: readiness probe takes the instance out of rotation
 
 | Field | Value |
 |---|---|
-| Injected | stop PostgreSQL, or point `DATABASE_URL` at a dead host |
+| Injected | `DATABASE_URL` pointed at a dead PostgreSQL endpoint |
 | Detected by | `/readyz/` returns 503; `app_readiness_failures_total` rises |
 | Time to detect | one probe interval |
-| Outcome | procedure documented, not automated |
+| Outcome | **pass — executed end to end** |
 
 This one cannot be driven over HTTP: it requires a dependency to actually fail.
+
+In the compose stack the equivalent is `docker compose stop db`, then
+`docker compose start db` to recover — the web container keeps running, which is
+the whole point.
 
 **Procedure.**
 
 ```bash
-# 1. Baseline.
-curl -sS -o /dev/null -w 'readyz %{http_code}\n' http://localhost:8000/readyz/
+# 1. Start the service with the database unreachable.
+#    NOTE: `manage.py runserver` cannot be used here. It calls check_migrations()
+#    during startup, which needs a connection, so the process exits before it can
+#    ever answer /readyz/. gunicorn does no such check -- which is exactly why a
+#    production container can be up-but-not-ready. This launcher reproduces
+#    gunicorn's behaviour with the standard library alone.
+DATABASE_URL=postgresql://bad:bad@127.0.0.1:59999/bad \
+  .venv/bin/python scripts/serve_for_drills.py
 
-# 2. Break the dependency.
-docker compose stop db
+# 2. Readiness must fail, naming the dependency and reporting how long the check took.
+curl -sS http://127.0.0.1:8000/readyz/
 
-# 3. Poll readiness. Expect 503 with the failing dependency named.
-for i in $(seq 1 10); do
-  curl -sS http://localhost:8000/readyz/ | python -m json.tool
-  sleep 2
-done
+# 3. Liveness must STILL be 200. This is the whole point.
+curl -o /dev/null -w 'healthz %{http_code}\n' http://127.0.0.1:8000/healthz/
 
-# 4. Confirm liveness is STILL 200. This is the whole point.
-curl -sS -o /dev/null -w 'healthz %{http_code}\n' http://localhost:8000/healthz/
+# 4. The counter must rise, once per failed probe.
+curl -sS http://127.0.0.1:8000/metrics | grep '^app_readiness_failures_total'
 
-# 5. Confirm the counter rose.
-curl -sS http://localhost:8000/metrics | grep '^app_readiness_failures_total'
-
-# 6. Restore.
-docker compose start db
-curl -sS -o /dev/null -w 'readyz %{http_code}\n' http://localhost:8000/readyz/
+# 5. With Prometheus running, the alert must fire.
+curl -sS http://127.0.0.1:9090/api/v1/alerts
 ```
 
-**Expected result.** `/readyz/` returns 503 with
-`checks.database.ok == false`; `/healthz/` returns **200 throughout**;
-`app_readiness_failures_total{dependency="database"}` increases; `up` stays 1.
+**Observed on 2026-09-20 (Run B, executed end to end):**
 
-**Why liveness must stay 200.** A liveness probe failing means "restart this
-process". If `/healthz/` also checked the database, a database outage would make
-the orchestrator restart every healthy worker in a loop — turning someone else's
-outage into a self-inflicted denial of service. `ops/tests/test_probes.py` has a
-test that fails if a database call is ever added to the liveness view.
+```
+readyz 1 -> 503  (5.019440s)
+readyz 2 -> 503  (5.020691s)
+...
+readyz 8 -> 503  (5.016867s)
 
-**Observed on 2026-09-20:** the readiness failure path was verified by unit test
-rather than by stopping a live database; `ops/tests/test_probes.py::TestReadiness`
-asserts the 503, the named dependency, the counter increment and the latency
-reporting, with the database cursor mocked to raise. The end-to-end version above
-has not been executed against a real stopped database. **That is a gap, and it is
-recorded here rather than implied away.**
+app_readiness_failures_total{dependency="database"} 9.0
+healthz -> 200
+```
+
+```json
+{
+  "status": "not_ready",
+  "checks": {
+    "database": {
+      "ok": false,
+      "error": "OperationalError: connection timeout expired",
+      "latency_ms": 5009.78
+    }
+  },
+  "request_id": "e6f8cfbedb9e43dc"
+}
+```
+
+and in Prometheus:
+
+```
+ReadinessCheckFailing   firing   severity=warning   value=15.85
+    summary: Readiness probe failing for dependency database
+    runbook: docs/runbooks/database-unreachable.md
+```
+
+Four things this proves, each of which was a design decision that could have been
+wrong:
+
+1. **Liveness survived a total database outage.** 200 throughout, while readiness
+   failed. If liveness also touched the database, the orchestrator would have
+   restarted every healthy worker in a loop — turning someone else's outage into a
+   self-inflicted denial of service.
+2. **Readiness failed closed and named the dependency.** 503, not 200-with-a-warning,
+   and the response says which dependency and why.
+3. **The failure took exactly `DB_CONNECT_TIMEOUT` (5 s).** The 5009.78 ms latency
+   is the timeout doing its job. Without it the probe would hang until the
+   orchestrator's own timeout fired, and the log would say "probe timed out"
+   instead of "connection timeout expired" — losing the diagnosis. This is also
+   what the diagnostic table in
+   [database-unreachable.md](runbooks/database-unreachable.md) is keyed on: ~0 ms
+   is a refusal, ~5000 ms is a timeout, and they have different causes.
+4. **The alert fired from real data.** `ReadinessCheckFailing` is driven by
+   `increase(app_readiness_failures_total[5m]) > 0`, so it fired without anyone
+   touching the rules.
+
+---
+
+## Run B — the alerting path under a real scrape interval
+
+Everything above was measured by polling `/metrics` directly. That proves the
+application exports the right numbers; it says nothing about whether the rules
+evaluate, whether they fire, or whether the dashboards render. This run covers
+that, with Prometheus and Grafana running natively and scraping every 15 seconds.
+
+### Every rule expression is valid against real data
+
+`/api/v1/rules` reports `health=ok` for all nine, which means every PromQL
+expression parsed *and* executed. A typo in a metric name or a label produces
+`health=err` here and a silent no-op in production.
+
+`promtool` agrees, before Prometheus is even started:
+
+```
+$ promtool check rules monitoring/prometheus/alert_rules.yml
+  SUCCESS: 9 rules found
+
+$ promtool check config monitoring/prometheus/prometheus.local.yml
+  SUCCESS: 1 rule files found
+  SUCCESS: ... is valid prometheus config file syntax
+```
+
+### The alerts fire when they should, and only then
+
+Baseline, with ~1% injected errors — nothing fires, correctly:
+
+| Alert | State |
+|---|---|
+| `AvailabilityBudgetBurnFast` | inactive (burn rate 2.5, threshold 14.4) |
+| `HighErrorRate` | inactive (1.3% errors, threshold 5%) |
+| `ErrorBudgetExhausted` | pending (budget 0.0, `for: 10m` not yet elapsed) |
+| `LatencyObjectiveBreach` | inactive (compliance 100%, threshold 99%) |
+| `ServiceDown` | inactive (target is up) |
+
+Then 8 minutes at ~15% injected errors, 3 793 requests:
+
+| Alert | State | Value | Threshold |
+|---|---|---|---|
+| `AvailabilityBudgetBurnFast` | **firing** (critical) | 23.3 | > 14.4 |
+| `HighErrorRate` | **firing** (critical) | 15.5% | > 5% |
+| `AvailabilityBudgetBurnSlow` | pending (warning) | 23.3 | > 6, `for: 30m` |
+| `ErrorBudgetExhausted` | pending (warning) | 0 | ≤ 0, `for: 10m` |
+
+**Two things worth reading off this table.** The burn-rate and the absolute error
+rate agree with each other and with the arithmetic: 15.5% errors against a 0.5%
+budget is a burn rate of 31, and the 1-hour window reports 23.3 because it still
+contains earlier healthy traffic. And the `for:` windows behave as designed — the
+2-minute rule fired first, the 5-minute rule second, and the 30-minute and
+10-minute rules were still pending when the run ended. **An alert that fires
+immediately is an alert that fires on every blip.**
+
+### Every dashboard panel renders
+
+All 27 panel queries from both dashboards were executed through Grafana's own
+datasource proxy, so a panel that would render empty is caught as an empty result
+rather than discovered by squinting at a screenshot:
+
+```
+27 panel queries executed   |   27 returned data   |   0 empty   |   0 errored
+```
+
+Before the readiness drill, 26 of 27 returned data — the exception was
+`Readiness probe failures by dependency`, which was empty because **no readiness
+check had ever failed**. That is the correct state, and it is why the panel is
+listed in the "not covered" table only until the drill is run. After the drill it
+reported `1 series, 24 points`.
+
+### An unplanned finding: the throttle works
+
+The 15% burst was driven at 8 req/s, well above the anonymous throttle of
+`120/min`. The load generator's own counters recorded the result:
+
+```
+3793 requests (200:1688, 403:431, 404:67, 429:1062, 500:545)
+```
+
+1 062 responses were `429 Too Many Requests`. That is `AnonRateThrottle` doing its
+job, and it is the reason the injected 15% error rate surfaced as 14.4% of total
+traffic: the throttle was shedding load before it reached the fault endpoint. Not
+a designed test, but a real one.
 
 ---
 
@@ -183,9 +324,10 @@ recorded here rather than implied away.**
 
 | Gap | Why | Impact |
 |---|---|---|
-| Alert firing and delivery | No Alertmanager in this stack | A critical alert appears in the Prometheus UI and is not delivered anywhere. See [KNOWN_ISSUES #8](KNOWN_ISSUES.md) |
+| Alert delivery | No Alertmanager in this stack | Alerts **fire** and are visible at `/alerts`; nothing is notified. See [KNOWN_ISSUES #8](KNOWN_ISSUES.md) |
 | Sentry event delivery | No DSN configured in this environment | The integration is unit-tested; the network hop is not. See [KNOWN_ISSUES #12](KNOWN_ISSUES.md) |
-| Detection latency behind a real scrape | Drills ran against a local instance, polling `/metrics` directly | In production, detection is bounded by the 15 s scrape interval plus the alert's `for:` window. The `0.01 s` figures above are the *floor*, not the expected value |
+| Container behaviour | Run B used native binaries, not the image | The `Dockerfile`, the entrypoint, the healthcheck and compose service discovery are unverified here. CI's `docker-build` and `end-to-end` jobs cover them |
+| Detection latency behind a load balancer | Nothing sits in front of the service | The 15 s scrape interval is included in Run B; network latency and proxy buffering are not |
 | Multi-worker behaviour | Single worker by design | See [KNOWN_ISSUES #1](KNOWN_ISSUES.md) |
 | Disk exhaustion | No `node_exporter` | See [KNOWN_ISSUES #9](KNOWN_ISSUES.md) |
 

@@ -21,7 +21,13 @@ global:
     environment: docker
 
 rule_files:
-  - /etc/prometheus/alert_rules.yml
+  # Relative on purpose. Prometheus resolves rule file patterns relative to the
+  # directory of the config file, so this works in the container (both files are
+  # mounted into /etc/prometheus/) *and* on a developer's machine -- which means
+  # `promtool check config` can validate the real config instead of a copy of it.
+  # An absolute /etc/prometheus/... path would only ever be checkable inside the
+  # container, i.e. never before the deploy that breaks.
+  - "alert_rules.yml"
 
 scrape_configs:
   # ---------------------------------------------------------------------------

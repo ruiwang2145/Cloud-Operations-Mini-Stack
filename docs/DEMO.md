@@ -221,6 +221,10 @@ docker compose down -v      # also removes the volumes (database, metrics, dashb
 
 ## Running without Docker
 
+Two options, depending on what needs demonstrating.
+
+### Just the service
+
 ```bash
 bash scripts/bootstrap.sh          # or: powershell -File scripts\bootstrap.ps1
 .venv/bin/python manage.py runserver
@@ -229,3 +233,41 @@ bash scripts/bootstrap.sh          # or: powershell -File scripts\bootstrap.ps1
 SQLite, no Prometheus, no Grafana. `/api/slo/` falls back to the in-process
 registry and says so in `window_source` — which is itself worth showing, because it
 is the honest-degradation decision in action.
+
+### The service plus real Prometheus and Grafana
+
+Both ship standalone binaries, so the alerting and dashboard path can be
+demonstrated with no container runtime, no administrator rights and no reboot —
+and this is how the results in [incident-drills.md](incident-drills.md) were
+produced. Full recipe: [native-monitoring.md](native-monitoring.md).
+
+```bash
+promtool check config monitoring/prometheus/prometheus.local.yml
+prometheus --config.file=monitoring/prometheus/prometheus.local.yml \
+           --storage.tsdb.path=/tmp/prometheus-data --web.enable-lifecycle
+```
+
+**What this demonstrates that the container path cannot be shown to:** the alert
+rules evaluating against live data at `/alerts`, and every dashboard panel
+rendering real numbers. Steps 4 to 7 above work exactly the same way, with
+`localhost:9090` and `localhost:3000` in place of the compose service names.
+
+### Drilling the readiness failure
+
+The one drill that cannot be run from outside the service. `manage.py runserver`
+refuses to start without a database, so use the launcher that skips startup
+checks — the same thing gunicorn does, which is why a production container can be
+up-but-not-ready:
+
+```bash
+DATABASE_URL=postgresql://bad:bad@127.0.0.1:59999/bad \
+  .venv/bin/python scripts/serve_for_drills.py
+
+curl -o /dev/null -w 'healthz %{http_code}\n' http://localhost:8000/healthz/   # 200
+curl -sS http://localhost:8000/readyz/                                         # 503
+curl -sS http://localhost:8000/metrics | grep app_readiness_failures_total
+```
+
+The point of the demo is the first line: **liveness stays 200 while readiness
+fails.** If liveness also touched the database, the orchestrator would restart
+every healthy worker in a loop during a database outage.

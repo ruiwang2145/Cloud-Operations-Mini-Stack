@@ -15,7 +15,7 @@ endif
 
 .DEFAULT_GOAL := help
 .PHONY: help setup run test lint fmt check smoke drill stack stack-down load seed \
-        rules rules-check clean
+        rules rules-check monitoring-check clean
 
 help:  ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -50,6 +50,14 @@ rules:  ## Regenerate the alert rules from the SLO definition
 
 rules-check:  ## Fail if the alert rules have drifted from the SLO definition
 	$(PYTHON) scripts/render_rules.py --check
+
+monitoring-check:  ## Validate the Prometheus config and rules with promtool
+	@command -v promtool >/dev/null 2>&1 || { \
+		echo "promtool not found. It ships with Prometheus -- see docs/native-monitoring.md"; \
+		exit 1; }
+	promtool check config monitoring/prometheus/prometheus.yml
+	promtool check config monitoring/prometheus/prometheus.local.yml
+	promtool check rules  monitoring/prometheus/alert_rules.yml
 
 check: lint rules-check test  ## Everything CI runs
 

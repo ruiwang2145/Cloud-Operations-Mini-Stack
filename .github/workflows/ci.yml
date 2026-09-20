@@ -69,6 +69,25 @@ jobs:
         # rules. This is the step that stops the third one drifting.
         run: python scripts/render_rules.py --check
 
+      - name: Prometheus config and rules are valid
+        # promtool is the real parser, so this catches things PyYAML cannot: an
+        # invalid PromQL expression, a duplicate alert name, a bad label matcher.
+        # A malformed rule file makes Prometheus refuse to start, which is a
+        # spectacular way to lose monitoring while changing monitoring.
+        #
+        # Both scrape configs are checked, and both load the same rule file --
+        # the native one exists so this can be verified without a container
+        # runtime, and it must not drift from the compose one.
+        run: |
+          for config in prometheus.yml prometheus.local.yml; do
+            docker run --rm \
+              -v "$PWD/monitoring/prometheus:/work" -w /work \
+              prom/prometheus:v3.14.0 promtool check config "$config"
+          done
+          docker run --rm \
+            -v "$PWD/monitoring/prometheus:/work" -w /work \
+            prom/prometheus:v3.14.0 promtool check rules alert_rules.yml
+
       - name: Migrations are complete
         # A model change without a migration passes every test (Django builds the
         # test database from the models) and fails on the first real deploy.
